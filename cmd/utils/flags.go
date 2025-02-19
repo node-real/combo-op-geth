@@ -34,7 +34,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ethereum/go-ethereum/core/opcodeCompiler/compiler"
+	"github.com/ethereum/go-ethereum/core/txpool/bundlepool"
 	pcsclite "github.com/gballet/go-libpcsclite"
 	gopsutil "github.com/shirou/gopsutil/mem"
 	"github.com/urfave/cli/v2"
@@ -44,6 +44,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/fdlimit"
 	"github.com/ethereum/go-ethereum/core"
+	"github.com/ethereum/go-ethereum/core/opcodeCompiler/compiler"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/txpool/legacypool"
 	"github.com/ethereum/go-ethereum/core/vm"
@@ -74,9 +75,9 @@ import (
 	"github.com/ethereum/go-ethereum/p2p/netutil"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rpc"
-	"github.com/ethereum/go-ethereum/trie"
-	"github.com/ethereum/go-ethereum/trie/triedb/hashdb"
-	"github.com/ethereum/go-ethereum/trie/triedb/pathdb"
+	"github.com/ethereum/go-ethereum/triedb"
+	"github.com/ethereum/go-ethereum/triedb/hashdb"
+	"github.com/ethereum/go-ethereum/triedb/pathdb"
 )
 
 // These are all the command line flags we support.
@@ -92,6 +93,12 @@ var (
 		Name:     "datadir",
 		Usage:    "Data directory for the databases and keystore",
 		Value:    flags.DirectoryString(node.DefaultDataDir()),
+		Category: flags.EthCategory,
+	}
+	MultiDataBaseFlag = &cli.BoolFlag{
+		Name: "multidatabase",
+		Usage: "Enable a separated state and block database, it will be created within two subdirectory called state and block, " +
+			"Users can copy this state or block directory to another directory or disk, and then create a symbolic link to the state directory under the chaindata",
 		Category: flags.EthCategory,
 	}
 	RemoteDBFlag = &cli.StringFlag{
@@ -294,6 +301,11 @@ var (
 		Usage:    "Manually specify the Optimism Ecotone fork timestamp, overriding the bundled setting",
 		Category: flags.EthCategory,
 	}
+	OverrideOptimismFjord = &cli.Uint64Flag{
+		Name:     "override.fjord",
+		Usage:    "Manually specify the Optimism Fjord fork timestamp, overriding the bundled setting",
+		Category: flags.EthCategory,
+	}
 	OverrideOptimismInterop = &cli.Uint64Flag{
 		Name:     "override.interop",
 		Usage:    "Manually specify the Optimsim Interop feature-set fork timestamp, overriding the bundled setting",
@@ -319,7 +331,7 @@ var (
 	PathDBNodeBufferTypeFlag = &cli.StringFlag{
 		Name:     "pathdb.nodebuffer",
 		Usage:    "Type of trienodebuffer to cache trie nodes in disklayer('list', 'sync', or 'async')",
-		Value:    "async",
+		Value:    "list",
 		Category: flags.StateCategory,
 	}
 	ProposeBlockIntervalFlag = &cli.Uint64Flag{
@@ -338,6 +350,12 @@ var (
 		Name:     "pathdb.keepproofblockspan",
 		Usage:    "Block span of keep proof (default = 90,000 blocks)",
 		Value:    params.FullImmutabilityThreshold,
+		Category: flags.StateCategory,
+	}
+	JournalFileFlag = &cli.BoolFlag{
+		Name:     "journalfile",
+		Usage:    "Enable using journal file to store the TrieJournal instead of KVDB in pbss (default = false)",
+		Value:    false,
 		Category: flags.StateCategory,
 	}
 	StateHistoryFlag = &cli.Uint64Flag{
@@ -392,6 +410,12 @@ var (
 		Value:    ethconfig.Defaults.TxPool.PriceBump,
 		Category: flags.TxPoolCategory,
 	}
+	TxPoolEnableAsyncPricedFlag = &cli.BoolFlag{
+		Name:     "txpool.asyncpriced",
+		Usage:    "enable async-priced-sorted list for txpool",
+		Value:    false,
+		Category: flags.TxPoolCategory,
+	}
 	TxPoolAccountSlotsFlag = &cli.Uint64Flag{
 		Name:     "txpool.accountslots",
 		Usage:    "Minimum number of executable transaction slots guaranteed per account",
@@ -433,6 +457,13 @@ var (
 		Usage:    "Wether reannnounce remote transactions or not(default = false)",
 		Value:    ethconfig.Defaults.TxPool.ReannounceRemotes,
 		Category: flags.TxPoolCategory,
+	}
+	// bundle pool settings
+	BundlePoolGlobalSlotsFlag = &cli.Uint64Flag{
+		Name:     "bundlepool.globalslots",
+		Usage:    "Maximum number of executable bundle slots for all accounts",
+		Value:    ethconfig.Defaults.BundlePool.GlobalSlots,
+		Category: flags.BundlePoolCategory,
 	}
 	// Blob transaction pool settings
 	BlobPoolDataDirFlag = &cli.StringFlag{
@@ -524,6 +555,12 @@ var (
 		Value:    ethconfig.Defaults.Miner.GasCeil,
 		Category: flags.MinerCategory,
 	}
+	MinerEffectiveGasLimitFlag = &cli.Uint64Flag{
+		Name:     "miner.effectivegaslimit",
+		Usage:    "If non-zero, an effective gas limit to apply in addition to the block header gaslimit.",
+		Value:    0,
+		Category: flags.MinerCategory,
+	}
 	MinerGasPriceFlag = &flags.BigFlag{
 		Name:     "miner.gasprice",
 		Usage:    "Minimum gas price for mining a transaction",
@@ -551,6 +588,22 @@ var (
 		Usage:    "Specify the maximum time allowance for creating a new payload",
 		Value:    ethconfig.Defaults.Miner.NewPayloadTimeout,
 		Category: flags.MinerCategory,
+	}
+	MevEnabledFlag = &cli.BoolFlag{
+		Name:     "mev.enable",
+		Usage:    "Enable mev",
+		Category: flags.MEVCategory,
+	}
+	MevBundleReceiverUrlFlag = &cli.StringFlag{
+		Name:     "mev.bundle.receiver.url",
+		Usage:    "Url of bundle receiver endpoint to use. Multiple urls are supported, separated by commas",
+		Category: flags.MEVCategory,
+	}
+	MevBundleGasPriceFloorFlag = &cli.Int64Flag{
+		Name:     "mev.bundle.gasprice.floor",
+		Usage:    "Minimum bundle gas price for mev",
+		Value:    ethconfig.Defaults.Miner.Mev.MevBundleGasPriceFloor,
+		Category: flags.MEVCategory,
 	}
 
 	// Account settings
@@ -1052,9 +1105,22 @@ Please note that --` + MetricsHTTPFlag.Name + ` must be set to start the server.
 		Category: flags.MetricsCategory,
 	}
 
+	ParallelTxDAGFlag = &cli.BoolFlag{
+		Name:     "parallel.txdag",
+		Usage:    "Enable the experimental parallel TxDAG generation (default = false)",
+		Category: flags.VMCategory,
+	}
+
 	VMOpcodeOptimizeFlag = &cli.BoolFlag{
 		Name:     "vm.opcode.optimize",
 		Usage:    "enable opcode optimization",
+		Category: flags.VMCategory,
+	}
+
+	ParallelTxDAGSenderPrivFlag = &cli.StringFlag{
+		Name:     "parallel.txdagsenderpriv",
+		Usage:    "private key of the sender who sends the TxDAG transactions",
+		Value:    "",
 		Category: flags.VMCategory,
 	}
 )
@@ -1167,13 +1233,6 @@ func setBootstrapNodes(ctx *cli.Context, cfg *p2p.Config) {
 			if ctx.Uint64(NetworkIdFlag.Name) == params.OpBNBTestnet {
 				urls = params.OpBNBTestnetBootnodes
 			}
-		case ctx.IsSet(OPNetworkFlag.Name):
-			network := ctx.String(OPNetworkFlag.Name)
-			if strings.Contains(strings.ToLower(network), "mainnet") {
-				urls = params.OPMainnetBootnodes
-			} else {
-				urls = params.OPSepoliaBootnodes
-			}
 		}
 	}
 	cfg.BootstrapNodes = mustParseBootnodes(urls)
@@ -1206,9 +1265,9 @@ func setBootstrapNodesV5(ctx *cli.Context, cfg *p2p.Config) {
 	case ctx.IsSet(OPNetworkFlag.Name):
 		network := ctx.String(OPNetworkFlag.Name)
 		if strings.Contains(strings.ToLower(network), "mainnet") {
-			urls = append(urls, params.OPMainnetBootnodes...)
+			urls = params.V5OPBootnodes
 		} else {
-			urls = append(urls, params.OPSepoliaBootnodes...)
+			urls = params.V5OPTestnetBootnodes
 		}
 	case ctx.Bool(OpBNBTestnetFlag.Name):
 		urls = params.OpBNBTestnetBootnodes
@@ -1670,6 +1729,9 @@ func setTxPool(ctx *cli.Context, cfg *legacypool.Config) {
 	if ctx.IsSet(TxPoolPriceBumpFlag.Name) {
 		cfg.PriceBump = ctx.Uint64(TxPoolPriceBumpFlag.Name)
 	}
+	if ctx.IsSet(TxPoolEnableAsyncPricedFlag.Name) {
+		cfg.EnableAsyncPriced = ctx.Bool(TxPoolEnableAsyncPricedFlag.Name)
+	}
 	if ctx.IsSet(TxPoolAccountSlotsFlag.Name) {
 		cfg.AccountSlots = ctx.Uint64(TxPoolAccountSlotsFlag.Name)
 	}
@@ -1685,11 +1747,22 @@ func setTxPool(ctx *cli.Context, cfg *legacypool.Config) {
 	if ctx.IsSet(TxPoolLifetimeFlag.Name) {
 		cfg.Lifetime = ctx.Duration(TxPoolLifetimeFlag.Name)
 	}
+	if ctx.IsSet(MinerEffectiveGasLimitFlag.Name) {
+		// While technically this is a miner config parameter, we also want the txpool to enforce
+		// it to avoid accepting transactions that can never be included in a block.
+		cfg.EffectiveGasCeil = ctx.Uint64(MinerEffectiveGasLimitFlag.Name)
+	}
 	if ctx.IsSet(TxPoolReannounceTimeFlag.Name) {
 		cfg.ReannounceTime = ctx.Duration(TxPoolReannounceTimeFlag.Name)
 	}
 	if ctx.IsSet(TxPoolReannounceRemotesFlag.Name) {
 		cfg.ReannounceRemotes = ctx.Bool(TxPoolReannounceRemotesFlag.Name)
+	}
+}
+
+func setBundlePool(ctx *cli.Context, cfg *bundlepool.Config) {
+	if ctx.IsSet(BundlePoolGlobalSlotsFlag.Name) {
+		cfg.GlobalSlots = ctx.Uint64(BundlePoolGlobalSlotsFlag.Name)
 	}
 }
 
@@ -1699,6 +1772,9 @@ func setMiner(ctx *cli.Context, cfg *miner.Config) {
 	}
 	if ctx.IsSet(MinerGasLimitFlag.Name) {
 		cfg.GasCeil = ctx.Uint64(MinerGasLimitFlag.Name)
+	}
+	if ctx.IsSet(MinerEffectiveGasLimitFlag.Name) {
+		cfg.EffectiveGasCeil = ctx.Uint64(MinerEffectiveGasLimitFlag.Name)
 	}
 	if ctx.IsSet(MinerGasPriceFlag.Name) {
 		cfg.GasPrice = flags.GlobalBig(ctx, MinerGasPriceFlag.Name)
@@ -1711,6 +1787,16 @@ func setMiner(ctx *cli.Context, cfg *miner.Config) {
 	}
 	if ctx.IsSet(RollupComputePendingBlock.Name) {
 		cfg.RollupComputePendingBlock = ctx.Bool(RollupComputePendingBlock.Name)
+	}
+	if ctx.IsSet(MevEnabledFlag.Name) {
+		cfg.Mev.MevEnabled = ctx.Bool(MevEnabledFlag.Name)
+	}
+	if ctx.IsSet(MevBundleReceiverUrlFlag.Name) {
+		url := ctx.String(MevBundleReceiverUrlFlag.Name)
+		cfg.Mev.MevReceivers = strings.Split(url, ",")
+	}
+	if ctx.IsSet(MevBundleGasPriceFloorFlag.Name) {
+		cfg.Mev.MevBundleGasPriceFloor = ctx.Int64(MevBundleGasPriceFloorFlag.Name)
 	}
 }
 
@@ -1793,6 +1879,7 @@ func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *ethconfig.Config) {
 	setEtherbase(ctx, cfg)
 	setGPO(ctx, &cfg.GPO)
 	setTxPool(ctx, &cfg.TxPool)
+	setBundlePool(ctx, &cfg.BundlePool)
 	setMiner(ctx, &cfg.Miner)
 	setRequiredBlocks(ctx, cfg)
 	setLes(ctx, cfg)
@@ -1878,6 +1965,10 @@ func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *ethconfig.Config) {
 	if ctx.IsSet(KeepProofBlockSpanFlag.Name) {
 		cfg.KeepProofBlockSpan = ctx.Uint64(KeepProofBlockSpanFlag.Name)
 	}
+	if ctx.IsSet(JournalFileFlag.Name) {
+		cfg.JournalFileEnabled = true
+	}
+
 	if ctx.String(GCModeFlag.Name) == "archive" && cfg.TransactionHistory != 0 {
 		cfg.TransactionHistory = 0
 		log.Warn("Disabled transaction unindexing for archive node")
@@ -1918,6 +2009,17 @@ func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *ethconfig.Config) {
 	if ctx.IsSet(VMEnableDebugFlag.Name) {
 		// TODO(fjl): force-enable this in --dev mode
 		cfg.EnablePreimageRecording = ctx.Bool(VMEnableDebugFlag.Name)
+	}
+
+	if ctx.IsSet(ParallelTxDAGFlag.Name) {
+		cfg.EnableParallelTxDAG = ctx.Bool(ParallelTxDAGFlag.Name)
+	}
+
+	if ctx.IsSet(ParallelTxDAGSenderPrivFlag.Name) {
+		priHex := ctx.String(ParallelTxDAGSenderPrivFlag.Name)
+		if cfg.Miner.ParallelTxDAGSenderPriv, err = crypto.HexToECDSA(priHex); err != nil {
+			Fatalf("Failed to parse txdag private key of %s, err: %v", ParallelTxDAGSenderPrivFlag.Name, err)
+		}
 	}
 
 	if ctx.IsSet(VMOpcodeOptimizeFlag.Name) {
@@ -2046,7 +2148,7 @@ func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *ethconfig.Config) {
 			if rawdb.ReadCanonicalHash(chaindb, 0) != (common.Hash{}) {
 				cfg.Genesis = nil // fallback to db content
 
-				//validate genesis has PoS enabled in block 0
+				// validate genesis has PoS enabled in block 0
 				genesis, err := core.ReadGenesis(chaindb)
 				if err != nil {
 					Fatalf("Could not read genesis from database: %v", err)
@@ -2256,12 +2358,47 @@ func MakeChainDatabase(ctx *cli.Context, stack *node.Node, readonly bool) ethdb.
 	case ctx.String(SyncModeFlag.Name) == "light":
 		chainDb, err = stack.OpenDatabase("lightchaindata", cache, handles, "", readonly)
 	default:
-		chainDb, err = stack.OpenDatabaseWithFreezer("chaindata", cache, handles, ctx.String(AncientFlag.Name), "", readonly)
+		chainDb, err = stack.OpenDatabaseWithFreezer("chaindata", cache, handles, ctx.String(AncientFlag.Name), "", readonly, false)
+		// set the separate state database
+		if stack.CheckIfMultiDataBase() && err == nil {
+			stateDiskDb := MakeStateDataBase(ctx, stack, readonly)
+			chainDb.SetStateStore(stateDiskDb)
+			blockDb := MakeBlockDatabase(ctx, stack, readonly)
+			chainDb.SetBlockStore(blockDb)
+		}
 	}
 	if err != nil {
 		Fatalf("Could not open database: %v", err)
 	}
 	return chainDb
+}
+
+// MakeStateDataBase open a separate state database using the flags passed to the client and will hard crash if it fails.
+func MakeStateDataBase(ctx *cli.Context, stack *node.Node, readonly bool) ethdb.Database {
+	cache := ctx.Int(CacheFlag.Name) * ctx.Int(CacheDatabaseFlag.Name) / 100
+	handles := MakeDatabaseHandles(ctx.Int(FDLimitFlag.Name)) * 90 / 100
+	stateDiskDb, err := stack.OpenDatabaseWithFreezer("chaindata/state", cache, handles, "", "", readonly, true)
+	if err != nil {
+		Fatalf("Failed to open separate trie database: %v", err)
+	}
+	return stateDiskDb
+}
+
+// MakeBlockDatabase open a separate block database using the flags passed to the client and will hard crash if it fails.
+func MakeBlockDatabase(ctx *cli.Context, stack *node.Node, readonly bool) ethdb.Database {
+	cache := ctx.Int(CacheFlag.Name) * ctx.Int(CacheDatabaseFlag.Name) / 100
+	handles := MakeDatabaseHandles(ctx.Int(FDLimitFlag.Name)) / 10
+	blockDb, err := stack.OpenDatabaseWithFreezer("chaindata/block", cache, handles, "", "", readonly, true)
+	if err != nil {
+		Fatalf("Failed to open separate block database: %v", err)
+	}
+	return blockDb
+}
+
+func PathDBConfigAddJournalFilePath(stack *node.Node, config *pathdb.Config) *pathdb.Config {
+	path := fmt.Sprintf("%s/%s", stack.ResolvePath("chaindata"), eth.JournalFileName)
+	config.JournalFilePath = path
+	return config
 }
 
 // tryMakeReadOnlyDatabase try to open the chain database in read-only mode,
@@ -2439,8 +2576,9 @@ func MakeConsolePreloads(ctx *cli.Context) []string {
 }
 
 // MakeTrieDatabase constructs a trie database based on the configured scheme.
-func MakeTrieDatabase(ctx *cli.Context, disk ethdb.Database, preimage bool, readOnly bool, isVerkle bool) *trie.Database {
-	config := &trie.Config{
+func MakeTrieDatabase(ctx *cli.Context, stack *node.Node, disk ethdb.Database, preimage bool, readOnly bool, isVerkle bool,
+	useBase bool) *triedb.Database {
+	config := &triedb.Config{
 		Preimages: preimage,
 		IsVerkle:  isVerkle,
 	}
@@ -2453,12 +2591,14 @@ func MakeTrieDatabase(ctx *cli.Context, disk ethdb.Database, preimage bool, read
 		// ignore the parameter silently. TODO(rjl493456442)
 		// please config it if read mode is implemented.
 		config.HashDB = hashdb.Defaults
-		return trie.NewDatabase(disk, config)
+		return triedb.NewDatabase(disk, config)
 	}
 	if readOnly {
 		config.PathDB = pathdb.ReadOnly
 	} else {
 		config.PathDB = pathdb.Defaults
 	}
-	return trie.NewDatabase(disk, config)
+	config.PathDB.UseBase = useBase
+	config.PathDB.JournalFilePath = fmt.Sprintf("%s/%s", stack.ResolvePath("chaindata"), eth.JournalFileName)
+	return triedb.NewDatabase(disk, config)
 }

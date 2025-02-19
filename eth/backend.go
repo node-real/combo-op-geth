@@ -26,6 +26,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ethereum/go-ethereum/core/txpool/bundlepool"
+
 	"github.com/ethereum/go-ethereum/accounts"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
@@ -59,6 +61,13 @@ import (
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/rpc"
+	"github.com/ethereum/go-ethereum/triedb/pathdb"
+)
+
+const (
+	ChainDBNamespace = "eth/db/chaindata/"
+	JournalFileName  = "trie.journal"
+	ChainData        = "chaindata"
 )
 
 // Config contains the configuration options of the ETH protocol.
@@ -124,7 +133,8 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 		log.Warn("Sanitizing invalid miner gas price", "provided", config.Miner.GasPrice, "updated", ethconfig.Defaults.Miner.GasPrice)
 		config.Miner.GasPrice = new(big.Int).Set(ethconfig.Defaults.Miner.GasPrice)
 	}
-	if config.NoPruning && config.TrieDirtyCache > 0 {
+
+	if config.StateScheme == rawdb.HashScheme && config.NoPruning && config.TrieDirtyCache > 0 {
 		if config.SnapshotCache > 0 {
 			config.TrieCleanCache += config.TrieDirtyCache * 3 / 5
 			config.SnapshotCache += config.TrieDirtyCache * 2 / 5
@@ -133,19 +143,33 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 		}
 		config.TrieDirtyCache = 0
 	}
-	log.Info("Allocated trie memory caches", "clean", common.StorageSize(config.TrieCleanCache)*1024*1024, "dirty", common.StorageSize(config.TrieDirtyCache)*1024*1024)
-
+	// Optimize memory distribution by reallocating surplus allowance from the
+	// dirty cache to the clean cache.
+	if config.StateScheme == rawdb.PathScheme && config.TrieDirtyCache > pathdb.MaxBufferSize/1024/1024 {
+		log.Info("Capped dirty cache size", "provided", common.StorageSize(config.TrieDirtyCache)*1024*1024,
+			"adjusted", common.StorageSize(pathdb.MaxBufferSize))
+		log.Info("Clean cache size", "provided", common.StorageSize(config.TrieCleanCache)*1024*1024,
+			"adjusted", common.StorageSize(config.TrieCleanCache+config.TrieDirtyCache-pathdb.MaxBufferSize/1024/1024)*1024*1024)
+		config.TrieCleanCache += config.TrieDirtyCache - pathdb.MaxBufferSize/1024/1024
+		config.TrieDirtyCache = pathdb.MaxBufferSize / 1024 / 1024
+	}
+	log.Info("Allocated memory caches",
+		"state_scheme", config.StateScheme,
+		"trie_clean_cache", common.StorageSize(config.TrieCleanCache)*1024*1024,
+		"trie_dirty_cache", common.StorageSize(config.TrieDirtyCache)*1024*1024,
+		"snapshot_cache", common.StorageSize(config.SnapshotCache)*1024*1024)
 	// Assemble the Ethereum object
-	chainDb, err := stack.OpenDatabaseWithFreezer("chaindata", config.DatabaseCache, config.DatabaseHandles, config.DatabaseFreezer, "eth/db/chaindata/", false)
+	chainDb, err := stack.OpenAndMergeDatabase("chaindata", ChainDBNamespace, false, config.DatabaseCache, config.DatabaseHandles,
+		config.DatabaseFreezer)
 	if err != nil {
 		return nil, err
 	}
-	scheme, err := rawdb.ParseStateScheme(config.StateScheme, chainDb)
+	config.StateScheme, err = rawdb.ParseStateScheme(config.StateScheme, chainDb)
 	if err != nil {
 		return nil, err
 	}
 	// Try to recover offline state pruning only in hash-based.
-	if scheme == rawdb.HashScheme {
+	if config.StateScheme == rawdb.HashScheme {
 		if err := pruner.RecoverPruning(stack.ResolvePath(""), chainDb); err != nil {
 			log.Error("Failed to recover state", "error", err)
 		}
@@ -196,6 +220,20 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 			rawdb.WriteDatabaseVersion(chainDb, core.BlockChainVersion)
 		}
 	}
+
+	var (
+		journalFilePath string
+		path            string
+	)
+	journalFilePath = fmt.Sprintf("%s/%s", stack.ResolvePath(ChainData), JournalFileName)
+	if config.JournalFileEnabled {
+		if stack.CheckIfMultiDataBase() {
+			path = ChainData + "/state"
+		} else {
+			path = ChainData
+		}
+		journalFilePath = stack.ResolvePath(path) + "/" + JournalFileName
+	}
 	var (
 		vmConfig = vm.Config{
 			EnablePreimageRecording:   config.EnablePreimageRecording,
@@ -211,12 +249,14 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 			Preimages:            config.Preimages,
 			NoTries:              config.NoTries,
 			StateHistory:         config.StateHistory,
-			StateScheme:          scheme,
+			StateScheme:          config.StateScheme,
 			TrieCommitInterval:   config.TrieCommitInterval,
 			PathNodeBuffer:       config.PathNodeBuffer,
 			ProposeBlockInterval: config.ProposeBlockInterval,
 			EnableProofKeeper:    config.EnableProofKeeper,
 			KeepProofBlockSpan:   config.KeepProofBlockSpan,
+			JournalFilePath:      journalFilePath,
+			JournalFile:          config.JournalFileEnabled,
 		}
 	)
 	// Override the chain config with provided settings.
@@ -233,6 +273,9 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 	if config.OverrideOptimismEcotone != nil {
 		overrides.OverrideOptimismEcotone = config.OverrideOptimismEcotone
 	}
+	if config.OverrideOptimismFjord != nil {
+		overrides.OverrideOptimismFjord = config.OverrideOptimismFjord
+	}
 	if config.OverrideOptimismInterop != nil {
 		overrides.OverrideOptimismInterop = config.OverrideOptimismInterop
 	}
@@ -240,6 +283,9 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 	eth.blockchain, err = core.NewBlockChain(chainDb, cacheConfig, config.Genesis, &overrides, eth.engine, vmConfig, eth.shouldPreserve, &config.TransactionHistory)
 	if err != nil {
 		return nil, err
+	}
+	if config.EnableParallelTxDAG {
+		eth.blockchain.SetupTxDAGGeneration()
 	}
 	if chainConfig := eth.blockchain.Config(); chainConfig.Optimism != nil { // config.Genesis.Config.ChainID cannot be used because it's based on CLI flags only, thus default to mainnet L1
 		config.NetworkId = chainConfig.ChainID.Uint64() // optimism defaults eth network ID to chain ID
@@ -267,13 +313,19 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 		blobPool := blobpool.New(config.BlobPool, eth.blockchain)
 		txPools = append(txPools, blobPool)
 	}
-	eth.txPool, err = txpool.New(new(big.Int).SetUint64(config.TxPool.PriceLimit), eth.blockchain, txPools)
+	bundlePool := &bundlepool.BundlePool{}
+	if config.Miner.Mev.MevEnabled {
+		bundlePool = bundlepool.New(config.BundlePool, config.Miner.Mev, eth.blockchain)
+		txPools = append(txPools, bundlePool)
+	}
+	eth.txPool, err = txpool.New(config.TxPool.PriceLimit, eth.blockchain, txPools)
 	if err != nil {
 		return nil, err
 	}
 	// Permit the downloader to use the trie cache allowance during fast sync
 	cacheLimit := cacheConfig.TrieCleanLimit + cacheConfig.TrieDirtyLimit + cacheConfig.SnapshotLimit
 	if eth.handler, err = newHandler(&handlerConfig{
+		DirectNodes:    stack.Config().P2P.DirectNodes,
 		Database:       chainDb,
 		Chain:          eth.blockchain,
 		TxPool:         eth.txPool,
@@ -290,6 +342,9 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 
 	eth.miner = miner.New(eth, &config.Miner, eth.blockchain.Config(), eth.EventMux(), eth.engine, eth.isLocalBlock)
 	eth.miner.SetExtra(makeExtraData(config.Miner.ExtraData))
+	if config.Miner.Mev.MevEnabled {
+		bundlePool.SetBundleSimulator(eth.miner)
+	}
 
 	eth.APIBackend = &EthAPIBackend{stack.Config().ExtRPCEnabled(), stack.Config().AllowUnprotectedTxs, config.RollupDisableTxPoolAdmission, eth, nil}
 	if eth.APIBackend.allowUnprotectedTxs {
@@ -381,7 +436,7 @@ func (s *Ethereum) APIs() []rpc.API {
 			Service:   NewMinerAPI(s),
 		}, {
 			Namespace: "eth",
-			Service:   downloader.NewDownloaderAPI(s.handler.downloader, s.eventMux),
+			Service:   downloader.NewDownloaderAPI(s.handler.downloader, s.blockchain, s.eventMux),
 		}, {
 			Namespace: "admin",
 			Service:   NewAdminAPI(s),

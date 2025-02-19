@@ -8,11 +8,12 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/txpool/blobpool"
+	"github.com/ethereum/go-ethereum/core/txpool/bundlepool"
 	"github.com/ethereum/go-ethereum/core/txpool/legacypool"
 	"github.com/ethereum/go-ethereum/eth/downloader"
 	"github.com/ethereum/go-ethereum/eth/gasprice"
 	"github.com/ethereum/go-ethereum/miner"
-	"github.com/ethereum/go-ethereum/trie/triedb/pathdb"
+	"github.com/ethereum/go-ethereum/triedb/pathdb"
 )
 
 // MarshalTOML marshals as TOML.
@@ -31,6 +32,9 @@ func (c Config) MarshalTOML() (interface{}, error) {
 		StateScheme                             string                 `toml:",omitempty"`
 		PathNodeBuffer                          pathdb.NodeBufferType  `toml:",omitempty"`
 		ProposeBlockInterval                    uint64                 `toml:",omitempty"`
+		EnableProofKeeper                       bool                   `toml:",omitempty"`
+		KeepProofBlockSpan                      uint64                 `toml:",omitempty"`
+		JournalFileEnabled                      bool                   `toml:",omitempty"`
 		RequiredBlocks                          map[uint64]common.Hash `toml:"-"`
 		LightServ                               int                    `toml:",omitempty"`
 		LightIngress                            int                    `toml:",omitempty"`
@@ -53,6 +57,7 @@ func (c Config) MarshalTOML() (interface{}, error) {
 		Miner                                   miner.Config
 		TxPool                                  legacypool.Config
 		BlobPool                                blobpool.Config
+		BundlePool                              bundlepool.Config
 		GPO                                     gasprice.Config
 		EnablePreimageRecording                 bool
 		DocRoot                                 string `toml:"-"`
@@ -63,6 +68,7 @@ func (c Config) MarshalTOML() (interface{}, error) {
 		OverrideVerkle                          *uint64 `toml:",omitempty"`
 		OverrideOptimismCanyon                  *uint64 `toml:",omitempty"`
 		OverrideOptimismEcotone                 *uint64 `toml:",omitempty"`
+		OverrideOptimismFjord                   *uint64 `toml:",omitempty"`
 		OverrideOptimismInterop                 *uint64 `toml:",omitempty"`
 		ApplySuperchainUpgrades                 bool    `toml:",omitempty"`
 		RollupSequencerHTTP                     string
@@ -87,6 +93,9 @@ func (c Config) MarshalTOML() (interface{}, error) {
 	enc.StateScheme = c.StateScheme
 	enc.PathNodeBuffer = c.PathNodeBuffer
 	enc.ProposeBlockInterval = c.ProposeBlockInterval
+	enc.EnableProofKeeper = c.EnableProofKeeper
+	enc.KeepProofBlockSpan = c.KeepProofBlockSpan
+	enc.JournalFileEnabled = c.JournalFileEnabled
 	enc.RequiredBlocks = c.RequiredBlocks
 	enc.LightServ = c.LightServ
 	enc.LightIngress = c.LightIngress
@@ -109,6 +118,7 @@ func (c Config) MarshalTOML() (interface{}, error) {
 	enc.Miner = c.Miner
 	enc.TxPool = c.TxPool
 	enc.BlobPool = c.BlobPool
+	enc.BundlePool = c.BundlePool
 	enc.GPO = c.GPO
 	enc.EnablePreimageRecording = c.EnablePreimageRecording
 	enc.DocRoot = c.DocRoot
@@ -119,6 +129,7 @@ func (c Config) MarshalTOML() (interface{}, error) {
 	enc.OverrideVerkle = c.OverrideVerkle
 	enc.OverrideOptimismCanyon = c.OverrideOptimismCanyon
 	enc.OverrideOptimismEcotone = c.OverrideOptimismEcotone
+	enc.OverrideOptimismFjord = c.OverrideOptimismFjord
 	enc.OverrideOptimismInterop = c.OverrideOptimismInterop
 	enc.ApplySuperchainUpgrades = c.ApplySuperchainUpgrades
 	enc.RollupSequencerHTTP = c.RollupSequencerHTTP
@@ -147,6 +158,9 @@ func (c *Config) UnmarshalTOML(unmarshal func(interface{}) error) error {
 		StateScheme                             *string                `toml:",omitempty"`
 		PathNodeBuffer                          *pathdb.NodeBufferType `toml:",omitempty"`
 		ProposeBlockInterval                    *uint64                `toml:",omitempty"`
+		EnableProofKeeper                       *bool                  `toml:",omitempty"`
+		KeepProofBlockSpan                      *uint64                `toml:",omitempty"`
+		JournalFileEnabled                      *bool                  `toml:",omitempty"`
 		RequiredBlocks                          map[uint64]common.Hash `toml:"-"`
 		LightServ                               *int                   `toml:",omitempty"`
 		LightIngress                            *int                   `toml:",omitempty"`
@@ -169,6 +183,7 @@ func (c *Config) UnmarshalTOML(unmarshal func(interface{}) error) error {
 		Miner                                   *miner.Config
 		TxPool                                  *legacypool.Config
 		BlobPool                                *blobpool.Config
+		BundlePool                              *bundlepool.Config
 		GPO                                     *gasprice.Config
 		EnablePreimageRecording                 *bool
 		DocRoot                                 *string `toml:"-"`
@@ -179,6 +194,7 @@ func (c *Config) UnmarshalTOML(unmarshal func(interface{}) error) error {
 		OverrideVerkle                          *uint64 `toml:",omitempty"`
 		OverrideOptimismCanyon                  *uint64 `toml:",omitempty"`
 		OverrideOptimismEcotone                 *uint64 `toml:",omitempty"`
+		OverrideOptimismFjord                   *uint64 `toml:",omitempty"`
 		OverrideOptimismInterop                 *uint64 `toml:",omitempty"`
 		ApplySuperchainUpgrades                 *bool   `toml:",omitempty"`
 		RollupSequencerHTTP                     *string
@@ -231,6 +247,15 @@ func (c *Config) UnmarshalTOML(unmarshal func(interface{}) error) error {
 	}
 	if dec.ProposeBlockInterval != nil {
 		c.ProposeBlockInterval = *dec.ProposeBlockInterval
+	}
+	if dec.EnableProofKeeper != nil {
+		c.EnableProofKeeper = *dec.EnableProofKeeper
+	}
+	if dec.KeepProofBlockSpan != nil {
+		c.KeepProofBlockSpan = *dec.KeepProofBlockSpan
+	}
+	if dec.JournalFileEnabled != nil {
+		c.JournalFileEnabled = *dec.JournalFileEnabled
 	}
 	if dec.RequiredBlocks != nil {
 		c.RequiredBlocks = dec.RequiredBlocks
@@ -298,6 +323,9 @@ func (c *Config) UnmarshalTOML(unmarshal func(interface{}) error) error {
 	if dec.BlobPool != nil {
 		c.BlobPool = *dec.BlobPool
 	}
+	if dec.BundlePool != nil {
+		c.BundlePool = *dec.BundlePool
+	}
 	if dec.GPO != nil {
 		c.GPO = *dec.GPO
 	}
@@ -327,6 +355,9 @@ func (c *Config) UnmarshalTOML(unmarshal func(interface{}) error) error {
 	}
 	if dec.OverrideOptimismEcotone != nil {
 		c.OverrideOptimismEcotone = dec.OverrideOptimismEcotone
+	}
+	if dec.OverrideOptimismFjord != nil {
+		c.OverrideOptimismFjord = dec.OverrideOptimismFjord
 	}
 	if dec.OverrideOptimismInterop != nil {
 		c.OverrideOptimismInterop = dec.OverrideOptimismInterop

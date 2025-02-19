@@ -17,17 +17,22 @@
 package miner
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"math/big"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/ethereum/go-ethereum/beacon/engine"
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/eth/tracers"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rlp"
@@ -37,12 +42,13 @@ import (
 // Check engine-api specification for more details.
 // https://github.com/ethereum/execution-apis/blob/main/src/engine/cancun.md#payloadattributesv3
 type BuildPayloadArgs struct {
-	Parent       common.Hash       // The parent block to build payload on top
-	Timestamp    uint64            // The provided timestamp of generated payload
-	FeeRecipient common.Address    // The provided recipient address for collecting transaction fee
-	Random       common.Hash       // The provided randomness value
-	Withdrawals  types.Withdrawals // The provided withdrawals
-	BeaconRoot   *common.Hash      // The provided beaconRoot (Cancun)
+	Parent       common.Hash           // The parent block to build payload on top
+	Timestamp    uint64                // The provided timestamp of generated payload
+	FeeRecipient common.Address        // The provided recipient address for collecting transaction fee
+	Random       common.Hash           // The provided randomness value
+	Withdrawals  types.Withdrawals     // The provided withdrawals
+	BeaconRoot   *common.Hash          // The provided beaconRoot (Cancun)
+	Version      engine.PayloadVersion // Versioning byte for payload id calculation.
 
 	NoTxPool     bool                 // Optimism addition: option to disable tx pool contents from being included
 	Transactions []*types.Transaction // Optimism addition: txs forced into the block via engine API
@@ -76,6 +82,7 @@ func (args *BuildPayloadArgs) Id() engine.PayloadID {
 
 	var out engine.PayloadID
 	copy(out[:], hasher.Sum(nil)[:8])
+	out[0] = byte(args.Version)
 	return out
 }
 
@@ -231,6 +238,15 @@ func (payload *Payload) resolve(onlyFull bool) *engine.ExecutionPayloadEnvelope 
 	return nil
 }
 
+func (payload *Payload) GetBlock() *types.Block {
+	if payload.full != nil {
+		return payload.full
+	} else if payload.empty != nil {
+		return payload.empty
+	}
+	return nil
+}
+
 // interruptBuilding sets an interrupt for a potentially ongoing
 // block building process.
 // This will prevent it from adding new transactions to the block, and if it is
@@ -259,6 +275,23 @@ func (payload *Payload) stopBuilding() {
 		log.Debug("Stop payload building.", "id", payload.id)
 		close(payload.stop)
 	})
+}
+
+// fix attempts to recover and repair the block and its associated data (such as MPT)
+// from the local blockchain
+// blockHash: The hash of the latest block that needs to be recovered and fixed.
+func (w *worker) fix(blockHash common.Hash) error {
+	log.Info("Fix operation started")
+
+	// Try to recover from local data
+	err := w.stateFixManager.RecoverFromLocal(w, blockHash)
+	if err != nil {
+		log.Error("Failed to recover from local data", "err", err)
+		return err
+	}
+
+	log.Info("Fix operation completed successfully")
+	return nil
 }
 
 // buildPayload builds the payload according to the provided parameters.
@@ -316,6 +349,18 @@ func (w *worker) buildPayload(args *BuildPayloadArgs) (*Payload, error) {
 		return nil, err
 	}
 
+	//check state of parent block
+	_, err = w.retrieveParentState(fullParams)
+	if err != nil && strings.Contains(err.Error(), "missing trie node") {
+		log.Error("missing parent state when building block, try to fix...")
+		// fix state data
+		fixErr := w.StartStateFix(args.Id(), fullParams.parentHash)
+		if fixErr != nil {
+			log.Error("fix failed", "err", fixErr)
+		}
+		return nil, err
+	}
+
 	payload := newPayload(nil, args.Id())
 	// set shared interrupt
 	fullParams.interrupt = payload.interrupt
@@ -341,7 +386,7 @@ func (w *worker) buildPayload(args *BuildPayloadArgs) (*Payload, error) {
 			log.Info("Stopping work on payload",
 				"id", payload.id,
 				"reason", stopReason,
-				"elapsed", time.Since(start).Milliseconds())
+				"elapsed", common.PrettyDuration(time.Since(start)))
 		}()
 
 		updatePayload := func() time.Duration {
@@ -427,4 +472,44 @@ func (w *worker) cacheMiningBlock(block *types.Block, env *environment) {
 
 	log.Info("Successfully cached sealed new block", "number", block.Number(), "root", block.Root(), "hash", hash,
 		"elapsed", common.PrettyDuration(time.Since(start)))
+}
+
+func (w *worker) retrieveParentState(genParams *generateParams) (state *state.StateDB, err error) {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+
+	log.Info("retrieveParentState validate")
+	// Find the parent block for sealing task
+	parent := w.chain.CurrentBlock()
+	if genParams.parentHash != (common.Hash{}) {
+		block := w.chain.GetBlockByHash(genParams.parentHash)
+		if block == nil {
+			return nil, fmt.Errorf("missing parent")
+		}
+		parent = block.Header()
+	}
+
+	state, err = w.chain.StateAt(parent.Root)
+
+	// If there is an error and Optimism is enabled in the chainConfig, allow reorg
+	if err != nil && w.chainConfig.Optimism != nil {
+		if historicalBackend, ok := w.eth.(BackendWithHistoricalState); ok {
+			// Attempt to retrieve the historical state
+			var release tracers.StateReleaseFunc
+			parentBlock := w.eth.BlockChain().GetBlockByHash(parent.Hash())
+			state, release, err = historicalBackend.StateAtBlock(
+				context.Background(), parentBlock, ^uint64(0), nil, false, false,
+			)
+
+			// Copy the state and release the resources
+			state = state.Copy()
+			release()
+		}
+	}
+
+	// Return the state and any error encountered
+	if err != nil {
+		return nil, err
+	}
+	return state, nil
 }

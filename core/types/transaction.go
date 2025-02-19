@@ -389,6 +389,7 @@ func (tx *Transaction) RollupCostData() RollupCostData {
 
 // RawSignatureValues returns the V, R, S signature values of the transaction.
 // The return values should not be modified by the caller.
+// The return values may be nil or zero, if the transaction is unsigned.
 func (tx *Transaction) RawSignatureValues() (v, r, s *big.Int) {
 	return tx.inner.rawSignatureValues()
 }
@@ -443,7 +444,20 @@ func (tx *Transaction) EffectiveGasTipCmp(other *Transaction, baseFee *big.Int) 
 	if baseFee == nil {
 		return tx.GasTipCapCmp(other)
 	}
-	return tx.EffectiveGasTipValue(baseFee).Cmp(other.EffectiveGasTipValue(baseFee))
+	// the EffectiveGasTipValue() always copies two big.Int, which cost almost 90% cpu resource of the whole function,
+	// so we define an alternative function to improve the performance.
+	return effectiveGasTipValue(tx, baseFee).Cmp(effectiveGasTipValue(other, baseFee))
+}
+
+func effectiveGasTipValue(tx *Transaction, baseFee *big.Int) *big.Int {
+	if tx.Type() == DepositTxType {
+		return new(big.Int)
+	}
+	if baseFee == nil {
+		return tx.inner.gasTipCap()
+	}
+	gasFeeCap := tx.inner.gasFeeCap()
+	return math.BigMin(tx.inner.gasTipCap(), new(big.Int).Sub(gasFeeCap, baseFee))
 }
 
 // EffectiveGasTipIntCmp compares the effective gasTipCap of a transaction to the given gasTipCap.
@@ -591,6 +605,9 @@ func (tx *Transaction) WithSignature(signer Signer, sig []byte) (*Transaction, e
 	r, s, v, err := signer.SignatureValues(tx, sig)
 	if err != nil {
 		return nil, err
+	}
+	if r == nil || s == nil || v == nil {
+		return nil, fmt.Errorf("%w: r: %s, s: %s, v: %s", ErrInvalidSig, r, s, v)
 	}
 	cpy := tx.inner.copy()
 	cpy.setSignatureValues(signer.ChainID(), v, r, s)

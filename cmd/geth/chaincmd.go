@@ -35,10 +35,12 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethdb"
+	"github.com/ethereum/go-ethereum/internal/era"
 	"github.com/ethereum/go-ethereum/internal/flags"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/metrics"
 	"github.com/ethereum/go-ethereum/node"
+	"github.com/ethereum/go-ethereum/params"
 	"github.com/urfave/cli/v2"
 )
 
@@ -52,6 +54,7 @@ var (
 			utils.CachePreimagesFlag,
 			utils.OverrideCancun,
 			utils.OverrideVerkle,
+			utils.MultiDataBaseFlag,
 		}, utils.DatabaseFlags),
 		Description: `
 The init command initializes a new genesis block and definition for the network.
@@ -123,6 +126,33 @@ last block to write. In this mode, the file will be appended
 if already existing. If the file ends with .gz, the output will
 be gzipped.`,
 	}
+	importHistoryCommand = &cli.Command{
+		Action:    importHistory,
+		Name:      "import-history",
+		Usage:     "Import an Era archive",
+		ArgsUsage: "<dir>",
+		Flags: flags.Merge([]cli.Flag{
+			utils.TxLookupLimitFlag,
+		},
+			utils.DatabaseFlags,
+			utils.NetworkFlags,
+		),
+		Description: `
+The import-history command will import blocks and their corresponding receipts
+from Era archives.
+`,
+	}
+	exportHistoryCommand = &cli.Command{
+		Action:    exportHistory,
+		Name:      "export-history",
+		Usage:     "Export blockchain history to Era archives",
+		ArgsUsage: "<dir> <first> <last>",
+		Flags:     flags.Merge(utils.DatabaseFlags),
+		Description: `
+The export-history command will export blocks and their corresponding receipts
+into Era archives. Eras are typically packaged in steps of 8192 blocks.
+`,
+	}
 	importPreimagesCommand = &cli.Command{
 		Action:    importPreimages,
 		Name:      "import-preimages",
@@ -192,13 +222,28 @@ func initGenesis(ctx *cli.Context) error {
 		overrides.OverrideVerkle = &v
 	}
 	for _, name := range []string{"chaindata", "lightchaindata"} {
-		chaindb, err := stack.OpenDatabaseWithFreezer(name, 0, 0, ctx.String(utils.AncientFlag.Name), "", false)
+		chaindb, err := stack.OpenDatabaseWithFreezer(name, 0, 0, ctx.String(utils.AncientFlag.Name), "", false, false)
 		if err != nil {
 			utils.Fatalf("Failed to open database: %v", err)
 		}
 		defer chaindb.Close()
 
-		triedb := utils.MakeTrieDatabase(ctx, chaindb, ctx.Bool(utils.CachePreimagesFlag.Name), false, genesis.IsVerkle())
+		// if the trie data dir has been set, new trie db with a new state database
+		if ctx.IsSet(utils.MultiDataBaseFlag.Name) {
+			statediskdb, dbErr := stack.OpenDatabaseWithFreezer(name+"/state", 0, 0, "", "", false, true)
+			if dbErr != nil {
+				utils.Fatalf("Failed to open separate trie database: %v", dbErr)
+			}
+			chaindb.SetStateStore(statediskdb)
+			blockdb, err := stack.OpenDatabaseWithFreezer(name+"/block", 0, 0, "", "", false, true)
+			if err != nil {
+				utils.Fatalf("Failed to open separate block database: %v", err)
+			}
+			chaindb.SetBlockStore(blockdb)
+			log.Warn("Multi-database is an experimental feature")
+		}
+
+		triedb := utils.MakeTrieDatabase(ctx, stack, chaindb, ctx.Bool(utils.CachePreimagesFlag.Name), false, genesis.IsVerkle(), true)
 		defer triedb.Close()
 
 		_, hash, err := core.SetupGenesisBlockWithOverride(chaindb, triedb, genesis, &overrides)
@@ -235,6 +280,13 @@ func dumpGenesis(ctx *cli.Context) error {
 				return err
 			}
 			continue
+		}
+		// set the separate state & block database
+		if stack.CheckIfMultiDataBase() && err == nil {
+			stateDiskDb := utils.MakeStateDataBase(ctx, stack, true)
+			db.SetStateStore(stateDiskDb)
+			blockDb := utils.MakeBlockDatabase(ctx, stack, true)
+			db.SetBlockStore(blockDb)
 		}
 		genesis, err := core.ReadGenesis(db)
 		if err != nil {
@@ -364,7 +416,97 @@ func exportChain(ctx *cli.Context) error {
 		}
 		err = utils.ExportAppendChain(chain, fp, uint64(first), uint64(last))
 	}
+	if err != nil {
+		utils.Fatalf("Export error: %v\n", err)
+	}
+	fmt.Printf("Export done in %v\n", time.Since(start))
+	return nil
+}
 
+func importHistory(ctx *cli.Context) error {
+	if ctx.Args().Len() != 1 {
+		utils.Fatalf("usage: %s", ctx.Command.ArgsUsage)
+	}
+
+	stack, _ := makeConfigNode(ctx)
+	defer stack.Close()
+
+	chain, db := utils.MakeChain(ctx, stack, false)
+	defer db.Close()
+
+	var (
+		start   = time.Now()
+		dir     = ctx.Args().Get(0)
+		network string
+	)
+
+	// Determine network.
+	if utils.IsNetworkPreset(ctx) {
+		switch {
+		case ctx.Bool(utils.MainnetFlag.Name):
+			network = "mainnet"
+		case ctx.Bool(utils.SepoliaFlag.Name):
+			network = "sepolia"
+		case ctx.Bool(utils.GoerliFlag.Name):
+			network = "goerli"
+		}
+	} else {
+		// No network flag set, try to determine network based on files
+		// present in directory.
+		var networks []string
+		for _, n := range params.NetworkNames {
+			entries, err := era.ReadDir(dir, n)
+			if err != nil {
+				return fmt.Errorf("error reading %s: %w", dir, err)
+			}
+			if len(entries) > 0 {
+				networks = append(networks, n)
+			}
+		}
+		if len(networks) == 0 {
+			return fmt.Errorf("no era1 files found in %s", dir)
+		}
+		if len(networks) > 1 {
+			return fmt.Errorf("multiple networks found, use a network flag to specify desired network")
+		}
+		network = networks[0]
+	}
+
+	if err := utils.ImportHistory(chain, db, dir, network); err != nil {
+		return err
+	}
+	fmt.Printf("Import done in %v\n", time.Since(start))
+	return nil
+}
+
+// exportHistory exports chain history in Era archives at a specified
+// directory.
+func exportHistory(ctx *cli.Context) error {
+	if ctx.Args().Len() != 3 {
+		utils.Fatalf("usage: %s", ctx.Command.ArgsUsage)
+	}
+
+	stack, _ := makeConfigNode(ctx)
+	defer stack.Close()
+
+	chain, _ := utils.MakeChain(ctx, stack, true)
+	start := time.Now()
+
+	var (
+		dir         = ctx.Args().Get(0)
+		first, ferr = strconv.ParseInt(ctx.Args().Get(1), 10, 64)
+		last, lerr  = strconv.ParseInt(ctx.Args().Get(2), 10, 64)
+	)
+	if ferr != nil || lerr != nil {
+		utils.Fatalf("Export error in parsing parameters: block number not an integer\n")
+	}
+	if first < 0 || last < 0 {
+		utils.Fatalf("Export error: block number must be greater than 0\n")
+	}
+	if head := chain.CurrentSnapBlock(); uint64(last) > head.Number.Uint64() {
+		utils.Fatalf("Export error: block number %d larger than head block %d\n", uint64(last), head.Number.Uint64())
+	}
+	err := utils.ExportHistory(chain, dir, uint64(first), uint64(last), uint64(era.MaxEra1Size))
 	if err != nil {
 		utils.Fatalf("Export error: %v\n", err)
 	}
@@ -463,7 +605,7 @@ func dump(ctx *cli.Context) error {
 	if err != nil {
 		return err
 	}
-	triedb := utils.MakeTrieDatabase(ctx, db, true, true, false) // always enable preimage lookup
+	triedb := utils.MakeTrieDatabase(ctx, stack, db, true, true, false, false) // always enable preimage lookup
 	defer triedb.Close()
 
 	state, err := state.New(root, state.NewDatabaseWithNodeDB(db, triedb), nil)

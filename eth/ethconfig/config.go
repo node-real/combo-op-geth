@@ -19,6 +19,7 @@ package ethconfig
 
 import (
 	"errors"
+	"github.com/ethereum/go-ethereum/core/txpool/bundlepool"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -34,7 +35,7 @@ import (
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/miner"
 	"github.com/ethereum/go-ethereum/params"
-	"github.com/ethereum/go-ethereum/trie/triedb/pathdb"
+	"github.com/ethereum/go-ethereum/triedb/pathdb"
 )
 
 // FullNodeGPO contains default gasprice oracle settings for full node.
@@ -50,26 +51,26 @@ var FullNodeGPO = gasprice.Config{
 
 // Defaults contains default settings for use on the Ethereum main net.
 var Defaults = Config{
-	SyncMode:           downloader.SnapSync,
-	NetworkId:          0,
-	TxLookupLimit:      2350000,
-	TransactionHistory: 2350000,
-	StateHistory:       params.FullImmutabilityThreshold,
-	LightPeers:         100,
-	DatabaseCache:      512,
-	TrieCleanCache:     154,
-	TrieDirtyCache:     256,
-	TrieTimeout:        60 * time.Minute,
-	TrieCommitInterval: 0,
-	SnapshotCache:      102,
-	FilterLogCacheSize: 32,
-	Miner:              miner.DefaultConfig,
-	TxPool:             legacypool.DefaultConfig,
-	BlobPool:           blobpool.DefaultConfig,
-	RPCGasCap:          50000000,
-	RPCEVMTimeout:      5 * time.Second,
-	GPO:                FullNodeGPO,
-	RPCTxFeeCap:        1, // 1 ether
+	SyncMode:               downloader.SnapSync,
+	NetworkId:              0,
+	TxLookupLimit:          2350000,
+	TransactionHistory:     2350000,
+	StateHistory:           params.FullImmutabilityThreshold,
+	LightPeers:             100,
+	DatabaseCache:          512,
+	TrieCleanCache:         154,
+	TrieDirtyCache:         256,
+	TrieTimeout:            60 * time.Minute,
+	TrieCommitInterval:     0,
+	SnapshotCache:          102,
+	FilterLogCacheSize:     32,
+	Miner:                  miner.DefaultConfig,
+	TxPool:                 legacypool.DefaultConfig,
+	BlobPool:               blobpool.DefaultConfig,
+	RPCGasCap:              50000000,
+	RPCEVMTimeout:          5 * time.Second,
+	GPO:                    FullNodeGPO,
+	RPCTxFeeCap:            1, // 1 ether
 	EnableOpcodeOptimizing: false,
 }
 
@@ -134,6 +135,7 @@ type Config struct {
 	ProposeBlockInterval uint64                `toml:",omitempty"` // Keep the same with op-proposer propose block interval
 	EnableProofKeeper    bool                  `toml:",omitempty"` // Whether to enable proof keeper
 	KeepProofBlockSpan   uint64                `toml:",omitempty"` // Span block of keep proof
+	JournalFileEnabled   bool                  `toml:",omitempty"` // Whether the TrieJournal is stored using journal file
 
 	// RequiredBlocks is a set of block number -> hash mappings which must be in the
 	// canonical chain of all remote peers. Setting the option makes geth verify the
@@ -169,8 +171,9 @@ type Config struct {
 	Miner miner.Config
 
 	// Transaction pool options
-	TxPool   legacypool.Config
-	BlobPool blobpool.Config
+	TxPool     legacypool.Config
+	BlobPool   blobpool.Config
+	BundlePool bundlepool.Config
 
 	// Gas Price Oracle options
 	GPO gasprice.Config
@@ -201,6 +204,8 @@ type Config struct {
 
 	OverrideOptimismEcotone *uint64 `toml:",omitempty"`
 
+	OverrideOptimismFjord *uint64 `toml:",omitempty"`
+
 	OverrideOptimismInterop *uint64 `toml:",omitempty"`
 
 	// ApplySuperchainUpgrades requests the node to load chain-configuration from the superchain-registry.
@@ -214,6 +219,7 @@ type Config struct {
 	RollupHaltOnIncompatibleProtocolVersion string
 
 	EnableOpcodeOptimizing bool
+	EnableParallelTxDAG    bool
 }
 
 // CreateConsensusEngine creates a consensus engine for the given chain config.

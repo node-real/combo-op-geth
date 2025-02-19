@@ -204,6 +204,11 @@ func makeFullNode(ctx *cli.Context) (*node.Node, ethapi.Backend) {
 		cfg.Eth.OverrideOptimismEcotone = &v
 	}
 
+	if ctx.IsSet(utils.OverrideOptimismFjord.Name) {
+		v := ctx.Uint64(utils.OverrideOptimismFjord.Name)
+		cfg.Eth.OverrideOptimismFjord = &v
+	}
+
 	if ctx.IsSet(utils.OverrideOptimismInterop.Name) {
 		v := ctx.Uint64(utils.OverrideOptimismInterop.Name)
 		cfg.Eth.OverrideOptimismInterop = &v
@@ -212,6 +217,10 @@ func makeFullNode(ctx *cli.Context) (*node.Node, ethapi.Backend) {
 	if ctx.IsSet(utils.OverrideVerkle.Name) {
 		v := ctx.Uint64(utils.OverrideVerkle.Name)
 		cfg.Eth.OverrideVerkle = &v
+	}
+
+	if ctx.Bool(utils.MiningEnabledFlag.Name) {
+		cfg.Eth.TxPool.EnableCache = true
 	}
 
 	backend, eth := utils.RegisterEthService(stack, &cfg.Eth)

@@ -22,6 +22,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/holiman/uint256"
+
 	"github.com/ethereum/go-ethereum/accounts"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/consensus"
@@ -113,10 +115,11 @@ type testWorkerBackend struct {
 	genesis *core.Genesis
 }
 
-func newTestWorkerBackend(t *testing.T, chainConfig *params.ChainConfig, engine consensus.Engine, db ethdb.Database, n int) *testWorkerBackend {
+func newTestWorkerBackend(t *testing.T, chainConfig *params.ChainConfig, engine consensus.Engine,
+	db ethdb.Database, n int, overrideVMConfig *vm.Config) *testWorkerBackend {
 	var gspec = &core.Genesis{
 		Config: chainConfig,
-		Alloc:  core.GenesisAlloc{testBankAddress: {Balance: testBankFunds}},
+		Alloc:  types.GenesisAlloc{testBankAddress: {Balance: testBankFunds}},
 	}
 	switch e := engine.(type) {
 	case *clique.Clique:
@@ -129,12 +132,16 @@ func newTestWorkerBackend(t *testing.T, chainConfig *params.ChainConfig, engine 
 	default:
 		t.Fatalf("unexpected consensus engine type: %T", engine)
 	}
-	chain, err := core.NewBlockChain(db, &core.CacheConfig{TrieDirtyDisabled: true}, gspec, nil, engine, vm.Config{}, nil, nil)
+	vmConfig := vm.Config{}
+	if overrideVMConfig != nil {
+		vmConfig = *overrideVMConfig
+	}
+	chain, err := core.NewBlockChain(db, &core.CacheConfig{TrieDirtyDisabled: true}, gspec, nil, engine, vmConfig, nil, nil)
 	if err != nil {
 		t.Fatalf("core.NewBlockChain failed: %v", err)
 	}
 	pool := legacypool.New(testTxPoolConfig, chain)
-	txpool, _ := txpool.New(new(big.Int).SetUint64(testTxPoolConfig.PriceLimit), chain, []txpool.SubPool{pool})
+	txpool, _ := txpool.New(testTxPoolConfig.PriceLimit, chain, []txpool.SubPool{pool})
 
 	return &testWorkerBackend{
 		db:      db,
@@ -158,10 +165,16 @@ func (b *testWorkerBackend) newRandomTx(creation bool) *types.Transaction {
 	return tx
 }
 
-func newTestWorker(t *testing.T, chainConfig *params.ChainConfig, engine consensus.Engine, db ethdb.Database, blocks int) (*worker, *testWorkerBackend) {
-	backend := newTestWorkerBackend(t, chainConfig, engine, db, blocks)
+func newTestWorker(t *testing.T, chainConfig *params.ChainConfig, engine consensus.Engine, db ethdb.Database,
+	blocks int, overrideConfig *Config, overrideVMConfig *vm.Config) (*worker, *testWorkerBackend) {
+	backend := newTestWorkerBackend(t, chainConfig, engine, db, blocks, overrideVMConfig)
 	backend.txPool.Add(pendingTxs, true, false)
-	w := newWorker(testConfig, chainConfig, engine, backend, new(event.TypeMux), nil, false)
+	time.Sleep(500 * time.Millisecond) // Wait for txs to be promoted
+	cfg := testConfig
+	if overrideConfig != nil {
+		cfg = overrideConfig
+	}
+	w := newWorker(cfg, chainConfig, engine, backend, new(event.TypeMux), nil, false)
 	w.setEtherbase(testBankAddress)
 	return w, backend
 }
@@ -175,7 +188,7 @@ func TestGenerateAndImportBlock(t *testing.T) {
 	config.Clique = &params.CliqueConfig{Period: 1, Epoch: 30000}
 	engine := clique.New(config.Clique, db)
 
-	w, b := newTestWorker(t, &config, engine, db, 0)
+	w, b := newTestWorker(t, &config, engine, db, 0, nil, nil)
 	defer w.close()
 
 	// This test chain imports the mined blocks.
@@ -197,6 +210,7 @@ func TestGenerateAndImportBlock(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		b.txPool.Add([]*types.Transaction{b.newRandomTx(true)}, true, false)
 		b.txPool.Add([]*types.Transaction{b.newRandomTx(false)}, true, false)
+		time.Sleep(1 * time.Second) // Wait for txs to be promoted
 
 		select {
 		case ev := <-sub.Chan():
@@ -207,6 +221,77 @@ func TestGenerateAndImportBlock(t *testing.T) {
 		case <-time.After(3 * time.Second): // Worker needs 1s to include new changes.
 			t.Fatalf("timeout")
 		}
+	}
+}
+
+func TestGenerateTxDAGGaslessBlock(t *testing.T) {
+	generateTxDAGGaslessBlock(t, true, true)
+	generateTxDAGGaslessBlock(t, true, false)
+	generateTxDAGGaslessBlock(t, false, true)
+	generateTxDAGGaslessBlock(t, false, false)
+}
+
+func generateTxDAGGaslessBlock(t *testing.T, enableMev, enableTxDAG bool) {
+	t.Log("generateTxDAGGaslessBlock", enableMev, enableTxDAG)
+	var (
+		db     = rawdb.NewMemoryDatabase()
+		config = *params.AllCliqueProtocolChanges
+	)
+	config.Optimism = &params.OptimismConfig{
+		EIP1559Elasticity:        2,
+		EIP1559Denominator:       8,
+		EIP1559DenominatorCanyon: 8,
+	}
+	cfg := Config{}
+	cfg = *testConfig
+	if enableMev {
+		cfg.Mev.MevEnabled = true
+	}
+	cfg.NewPayloadTimeout = 3 * time.Second
+	cfg.ParallelTxDAGSenderPriv, _ = crypto.ToECDSA(crypto.Keccak256([]byte{1}))
+	vmConfig := vm.Config{NoBaseFee: true}
+	engine := clique.New(config.Clique, db)
+
+	w, b := newTestWorker(t, &config, engine, db, 0, &cfg, &vmConfig)
+	defer w.close()
+	if enableTxDAG {
+		w.chain.SetupTxDAGGeneration()
+	}
+
+	// Ignore empty commit here for less noise.
+	w.skipSealHook = func(task *task) bool {
+		return len(task.receipts) == 0
+	}
+
+	// Start mining!
+	w.start()
+
+	for i := 0; i < 5; i++ {
+		b.txPool.Add([]*types.Transaction{b.newRandomTx(true)}, true, false)
+		b.txPool.Add([]*types.Transaction{b.newRandomTx(false)}, true, false)
+		time.Sleep(1 * time.Second) // Wait for txs to be promoted
+
+		block := w.getSealingBlock(&generateParams{
+			timestamp:   uint64(time.Now().Unix()),
+			forceTime:   false,
+			parentHash:  common.Hash{},
+			coinbase:    common.Address{},
+			random:      common.Hash{},
+			withdrawals: nil,
+			beaconRoot:  nil,
+			noTxs:       false,
+			txs: types.Transactions{
+				types.NewTx(&types.DepositTx{
+					To:    nil, // contract creation
+					Value: big.NewInt(6),
+					Gas:   50,
+				})},
+			gasLimit:  nil,
+			interrupt: nil,
+			isUpdate:  false,
+		})
+		txDAG, _ := types.GetTxDAG(block.block)
+		t.Log("block", block.block.NumberU64(), "txs", len(block.block.Transactions()), "txdag", txDAG)
 	}
 }
 
@@ -222,13 +307,13 @@ func TestEmptyWorkClique(t *testing.T) {
 func testEmptyWork(t *testing.T, chainConfig *params.ChainConfig, engine consensus.Engine) {
 	defer engine.Close()
 
-	w, _ := newTestWorker(t, chainConfig, engine, rawdb.NewMemoryDatabase(), 0)
+	w, _ := newTestWorker(t, chainConfig, engine, rawdb.NewMemoryDatabase(), 0, nil, nil)
 	defer w.close()
 
 	taskCh := make(chan struct{}, 2)
 	checkEqual := func(t *testing.T, task *task) {
 		// The work should contain 1 tx
-		receiptLen, balance := 1, big.NewInt(1000)
+		receiptLen, balance := 1, uint256.NewInt(1000)
 		if len(task.receipts) != receiptLen {
 			t.Fatalf("receipt number mismatch: have %d, want %d", len(task.receipts), receiptLen)
 		}
@@ -267,7 +352,7 @@ func TestAdjustIntervalClique(t *testing.T) {
 func testAdjustInterval(t *testing.T, chainConfig *params.ChainConfig, engine consensus.Engine) {
 	defer engine.Close()
 
-	w, _ := newTestWorker(t, chainConfig, engine, rawdb.NewMemoryDatabase(), 0)
+	w, _ := newTestWorker(t, chainConfig, engine, rawdb.NewMemoryDatabase(), 0, nil, nil)
 	defer w.close()
 
 	w.skipSealHook = func(task *task) bool {
@@ -372,7 +457,7 @@ func TestGetSealingWorkPostMerge(t *testing.T) {
 func testGetSealingWork(t *testing.T, chainConfig *params.ChainConfig, engine consensus.Engine) {
 	defer engine.Close()
 
-	w, b := newTestWorker(t, chainConfig, engine, rawdb.NewMemoryDatabase(), 0)
+	w, b := newTestWorker(t, chainConfig, engine, rawdb.NewMemoryDatabase(), 0, nil, nil)
 	defer w.close()
 
 	w.setExtra([]byte{0x01, 0x02})

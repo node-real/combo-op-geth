@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	crand "crypto/rand"
+	"errors"
 	"fmt"
 	"math/big"
 	"math/rand"
@@ -29,6 +30,8 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/mattn/go-colorable"
 
 	"github.com/ethereum/go-ethereum/beacon/engine"
 	"github.com/ethereum/go-ethereum/common"
@@ -50,7 +53,6 @@ import (
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rpc"
 	"github.com/ethereum/go-ethereum/trie"
-	"github.com/mattn/go-colorable"
 )
 
 var (
@@ -73,7 +75,7 @@ func generateMergeChain(n int, merged bool) (*core.Genesis, []*types.Block) {
 	}
 	genesis := &core.Genesis{
 		Config: &config,
-		Alloc: core.GenesisAlloc{
+		Alloc: types.GenesisAlloc{
 			testAddr:                         {Balance: testBalance},
 			params.BeaconRootsStorageAddress: {Balance: common.Big0, Code: common.Hex2Bytes("3373fffffffffffffffffffffffffffffffffffffffe14604457602036146024575f5ffd5b620180005f350680545f35146037575f5ffd5b6201800001545f5260205ff35b6201800042064281555f359062018000015500")},
 		},
@@ -115,6 +117,8 @@ func TestEth2AssembleBlock(t *testing.T) {
 		t.Fatalf("error signing transaction, err=%v", err)
 	}
 	ethservice.TxPool().Add([]*types.Transaction{tx}, true, false)
+	// we wait for the tx to be promoted into pending list in the txpool
+	time.Sleep(500 * time.Millisecond)
 	blockParams := engine.PayloadAttributes{
 		Timestamp: blocks[9].Time() + 5,
 	}
@@ -152,6 +156,8 @@ func TestEth2AssembleBlockWithAnotherBlocksTxs(t *testing.T) {
 	// Put the 10th block's tx in the pool and produce a new block
 	txs := blocks[9].Transactions()
 	api.eth.TxPool().Add(txs, false, true)
+	// we wait for the tx to be promoted into pending list in the txpool
+	time.Sleep(500 * time.Millisecond)
 	blockParams := engine.PayloadAttributes{
 		Timestamp: blocks[8].Time() + 5,
 	}
@@ -192,6 +198,8 @@ func TestEth2PrepareAndGetPayload(t *testing.T) {
 	// Put the 10th block's tx in the pool and produce a new block
 	txs := blocks[9].Transactions()
 	ethservice.TxPool().Add(txs, true, false)
+	// we wait for the txs to be promoted into pending list in the txpool
+	time.Sleep(500 * time.Millisecond)
 	blockParams := engine.PayloadAttributes{
 		Timestamp: blocks[8].Time() + 5,
 	}
@@ -210,6 +218,7 @@ func TestEth2PrepareAndGetPayload(t *testing.T) {
 		FeeRecipient: blockParams.SuggestedFeeRecipient,
 		Random:       blockParams.Random,
 		BeaconRoot:   blockParams.BeaconRoot,
+		Version:      engine.PayloadV1,
 	}).Id()
 	require.Equal(t, payloadID, *resp.PayloadID)
 	require.NoError(t, waitForApiPayloadToBuild(api, *resp.PayloadID))
@@ -263,11 +272,8 @@ func TestInvalidPayloadTimestamp(t *testing.T) {
 		{0, true},
 		{parent.Time, true},
 		{parent.Time - 1, true},
-
-		// TODO (MariusVanDerWijden) following tests are currently broken,
-		// fixed in upcoming merge-kiln-v2 pr
-		//{parent.Time() + 1, false},
-		//{uint64(time.Now().Unix()) + uint64(time.Minute), false},
+		{parent.Time + 1, false},
+		{uint64(time.Now().Unix()) + uint64(time.Minute), false},
 	}
 
 	for i, test := range tests {
@@ -315,6 +321,9 @@ func TestEth2NewBlock(t *testing.T) {
 		nonce := statedb.GetNonce(testAddr)
 		tx, _ := types.SignTx(types.NewContractCreation(nonce, new(big.Int), 1000000, big.NewInt(2*params.InitialBaseFee), logCode), types.LatestSigner(ethservice.BlockChain().Config()), testKey)
 		ethservice.TxPool().Add([]*types.Transaction{tx}, true, false)
+
+		//we wait for the tx to be promoted into pending list in the txpool
+		time.Sleep(500 * time.Millisecond)
 
 		execData, err := assembleWithTransactions(api, parent.Hash(), &engine.PayloadAttributes{
 			Timestamp: parent.Time() + 5,
@@ -489,6 +498,8 @@ func TestFullAPI(t *testing.T) {
 		nonce := statedb.GetNonce(testAddr)
 		tx, _ := types.SignTx(types.NewContractCreation(nonce, new(big.Int), 1000000, big.NewInt(2*params.InitialBaseFee), logCode), types.LatestSigner(ethservice.BlockChain().Config()), testKey)
 		ethservice.TxPool().Add([]*types.Transaction{tx}, true, false)
+		// we wait for the tx to be promoted into pending list in the txpool
+		time.Sleep(500 * time.Millisecond)
 	}
 
 	setupBlocks(t, ethservice, 10, parent, callback, nil)
@@ -615,6 +626,8 @@ func TestNewPayloadOnInvalidChain(t *testing.T) {
 			Data:     logCode,
 		})
 		ethservice.TxPool().Add([]*types.Transaction{tx}, false, true)
+		// we wait for the tx to be promoted into pending list in the txpool
+		time.Sleep(500 * time.Millisecond)
 		var (
 			params = engine.PayloadAttributes{
 				Timestamp:             parent.Time + 1,
@@ -704,7 +717,7 @@ func TestEmptyBlocks(t *testing.T) {
 	payload := getNewPayload(t, api, commonAncestor, nil)
 
 	status, err := api.NewPayloadV1(*payload)
-	if err != nil {
+	if err != nil && !errors.Is(err, downloader.ErrForcedNeeded) {
 		t.Fatal(err)
 	}
 	if status.Status != engine.VALID {
@@ -720,7 +733,7 @@ func TestEmptyBlocks(t *testing.T) {
 	payload = setBlockhash(payload)
 	// Now latestValidHash should be the common ancestor
 	status, err = api.NewPayloadV1(*payload)
-	if err != nil {
+	if err != nil && !errors.Is(err, downloader.ErrForcedNeeded) {
 		t.Fatal(err)
 	}
 	if status.Status != engine.INVALID {
@@ -738,7 +751,7 @@ func TestEmptyBlocks(t *testing.T) {
 	payload = setBlockhash(payload)
 	// Now latestValidHash should be the common ancestor
 	status, err = api.NewPayloadV1(*payload)
-	if err != nil {
+	if err != nil && !errors.Is(err, downloader.ErrForcedNeeded) {
 		t.Fatal(err)
 	}
 	if status.Status != engine.SYNCING {
@@ -850,7 +863,7 @@ func TestTrickRemoteBlockCache(t *testing.T) {
 	// feed the payloads to node B
 	for _, payload := range invalidChain {
 		status, err := apiB.NewPayloadV1(*payload)
-		if err != nil {
+		if err != nil && !errors.Is(err, downloader.ErrForcedNeeded) {
 			panic(err)
 		}
 		if status.Status == engine.VALID {
@@ -1084,6 +1097,7 @@ func TestWithdrawals(t *testing.T) {
 		Random:       blockParams.Random,
 		Withdrawals:  blockParams.Withdrawals,
 		BeaconRoot:   blockParams.BeaconRoot,
+		Version:      engine.PayloadV2,
 	}).Id()
 	require.Equal(t, payloadID, *resp.PayloadID)
 	require.NoError(t, waitForApiPayloadToBuild(api, payloadID))
@@ -1134,6 +1148,7 @@ func TestWithdrawals(t *testing.T) {
 		Random:       blockParams.Random,
 		Withdrawals:  blockParams.Withdrawals,
 		BeaconRoot:   blockParams.BeaconRoot,
+		Version:      engine.PayloadV2,
 	}).Id()
 	require.Equal(t, payloadID, *resp.PayloadID)
 	require.NoError(t, waitForApiPayloadToBuild(api, payloadID))
@@ -1249,7 +1264,18 @@ func TestNilWithdrawals(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		resp, err := api.ForkchoiceUpdatedV2(fcState, &test.blockParams)
+		var (
+			err            error
+			payloadVersion engine.PayloadVersion
+			shanghai       = genesis.Config.IsShanghai(genesis.Config.LondonBlock, test.blockParams.Timestamp)
+		)
+		if !shanghai {
+			payloadVersion = engine.PayloadV1
+			_, err = api.ForkchoiceUpdatedV1(fcState, &test.blockParams)
+		} else {
+			payloadVersion = engine.PayloadV2
+			_, err = api.ForkchoiceUpdatedV2(fcState, &test.blockParams)
+		}
 		if test.wantErr {
 			if err == nil {
 				t.Fatal("wanted error on fcuv2 with invalid withdrawals")
@@ -1268,15 +1294,20 @@ func TestNilWithdrawals(t *testing.T) {
 			Random:       test.blockParams.Random,
 			BeaconRoot:   test.blockParams.BeaconRoot,
 			Withdrawals:  test.blockParams.Withdrawals,
+			Version:      payloadVersion,
 		}).Id()
-		require.Equal(t, payloadID, *resp.PayloadID)
-		require.NoError(t, waitForApiPayloadToBuild(api, payloadID))
 		execData, err := api.GetPayloadV2(payloadID)
 		if err != nil {
 			t.Fatalf("error getting payload, err=%v", err)
 		}
-		if status, err := api.NewPayloadV2(*execData.ExecutionPayload); err != nil {
-			t.Fatalf("error validating payload: %v", err)
+		var status engine.PayloadStatusV1
+		if !shanghai {
+			status, err = api.NewPayloadV1(*execData.ExecutionPayload)
+		} else {
+			status, err = api.NewPayloadV2(*execData.ExecutionPayload)
+		}
+		if err != nil {
+			t.Fatalf("error validating payload: %v", err.(*engine.EngineAPIError).ErrorData())
 		} else if status.Status != engine.VALID {
 			t.Fatalf("invalid payload")
 		}
@@ -1286,8 +1317,8 @@ func TestNilWithdrawals(t *testing.T) {
 func setupBodies(t *testing.T) (*node.Node, *eth.Ethereum, []*types.Block) {
 	genesis, blocks := generateMergeChain(10, true)
 	// enable shanghai on the last block
-	time := blocks[len(blocks)-1].Header().Time + 1
-	genesis.Config.ShanghaiTime = &time
+	blocktime := blocks[len(blocks)-1].Header().Time + 1
+	genesis.Config.ShanghaiTime = &blocktime
 	n, ethservice := startEthService(t, genesis, blocks)
 
 	var (
@@ -1301,6 +1332,8 @@ func setupBodies(t *testing.T) (*node.Node, *eth.Ethereum, []*types.Block) {
 		nonce := statedb.GetNonce(testAddr)
 		tx, _ := types.SignTx(types.NewContractCreation(nonce, new(big.Int), 1000000, big.NewInt(2*params.InitialBaseFee), logCode), types.LatestSigner(ethservice.BlockChain().Config()), testKey)
 		ethservice.TxPool().Add([]*types.Transaction{tx}, false, false)
+		// we wait for the tx to be promoted into pending list in the txpool
+		time.Sleep(500 * time.Millisecond)
 	}
 
 	withdrawals := make([][]*types.Withdrawal, 10)
@@ -1602,7 +1635,7 @@ func TestParentBeaconBlockRoot(t *testing.T) {
 	fcState := engine.ForkchoiceStateV1{
 		HeadBlockHash: parent.Hash(),
 	}
-	resp, err := api.ForkchoiceUpdatedV2(fcState, &blockParams)
+	resp, err := api.ForkchoiceUpdatedV3(fcState, &blockParams)
 	if err != nil {
 		t.Fatalf("error preparing payload, err=%v", err.(*engine.EngineAPIError).ErrorData())
 	}
@@ -1618,6 +1651,7 @@ func TestParentBeaconBlockRoot(t *testing.T) {
 		Random:       blockParams.Random,
 		Withdrawals:  blockParams.Withdrawals,
 		BeaconRoot:   blockParams.BeaconRoot,
+		Version:      engine.PayloadV3,
 	}).Id()
 	require.Equal(t, payloadID, *resp.PayloadID)
 	require.NoError(t, waitForApiPayloadToBuild(api, *resp.PayloadID))
@@ -1666,4 +1700,27 @@ func waitForPayloadToBuild(payload *miner.Payload) {
 
 func waitForApiPayloadToBuild(api *ConsensusAPI, id engine.PayloadID) error {
 	return api.localBlocks.waitFull(id)
+}
+
+// TestGetClientVersion verifies the expected version info is returned.
+func TestGetClientVersion(t *testing.T) {
+	genesis, preMergeBlocks := generateMergeChain(10, false)
+	n, ethservice := startEthService(t, genesis, preMergeBlocks)
+	defer n.Close()
+
+	api := NewConsensusAPI(ethservice)
+	info := engine.ClientVersionV1{
+		Code:    "TT",
+		Name:    "test",
+		Version: "1.1.1",
+		Commit:  "0x12345678",
+	}
+	infos := api.GetClientVersionV1(info)
+	if len(infos) != 1 {
+		t.Fatalf("expected only one returned client version, got %d", len(infos))
+	}
+	info = infos[0]
+	if info.Code != engine.ClientCode || info.Name != engine.ClientName || info.Version != params.VersionWithMeta {
+		t.Fatalf("client info does match expected, got %s", info.String())
+	}
 }

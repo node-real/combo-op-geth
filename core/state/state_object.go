@@ -19,10 +19,12 @@ package state
 import (
 	"bytes"
 	"fmt"
-	"github.com/ethereum/go-ethereum/core/opcodeCompiler/compiler"
 	"io"
-	"math/big"
+	"slices"
+	"sync"
 	"time"
+
+	"github.com/ethereum/go-ethereum/core/opcodeCompiler/compiler"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
@@ -30,6 +32,7 @@ import (
 	"github.com/ethereum/go-ethereum/metrics"
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/trie/trienode"
+	"github.com/holiman/uint256"
 )
 
 type Code []byte
@@ -68,6 +71,11 @@ type stateObject struct {
 	origin   *types.StateAccount // Account original data without any change applied, nil means it was not existent
 	data     types.StateAccount  // Account data with all mutations applied in the scope of block
 
+	// dirty account state
+	dirtyBalance  *uint256.Int
+	dirtyNonce    *uint64
+	dirtyCodeHash []byte
+
 	// Write caches.
 	trie Trie // storage trie, which becomes non-nil on first access
 	code Code // contract bytecode, which gets set when code is loaded
@@ -94,7 +102,7 @@ type stateObject struct {
 
 // empty returns whether the account is considered empty.
 func (s *stateObject) empty() bool {
-	return s.data.Nonce == 0 && s.data.Balance.Sign() == 0 && bytes.Equal(s.data.CodeHash, types.EmptyCodeHash.Bytes())
+	return s.Nonce() == 0 && s.Balance().IsZero() && bytes.Equal(s.CodeHash(), types.EmptyCodeHash.Bytes())
 }
 
 // newObject creates a state object.
@@ -106,7 +114,7 @@ func newObject(db *StateDB, address common.Address, acct *types.StateAccount) *s
 	if acct == nil {
 		acct = types.NewEmptyStateAccount()
 	}
-	return &stateObject{
+	s := &stateObject{
 		db:             db,
 		address:        address,
 		addrHash:       crypto.Keccak256Hash(address[:]),
@@ -117,6 +125,15 @@ func newObject(db *StateDB, address common.Address, acct *types.StateAccount) *s
 		dirtyStorage:   make(Storage),
 		created:        created,
 	}
+
+	// dirty data when create a new account
+	if created {
+		s.dirtyBalance = new(uint256.Int).Set(acct.Balance)
+		s.dirtyNonce = new(uint64)
+		*s.dirtyNonce = acct.Nonce
+		s.dirtyCodeHash = acct.CodeHash
+	}
+	return s
 }
 
 // EncodeRLP implements rlp.Encoder.
@@ -186,7 +203,7 @@ func (s *stateObject) GetCommittedState(key common.Hash) common.Hash {
 	//   1) resurrect happened, and new slot values were set -- those should
 	//      have been handles via pendingStorage above.
 	//   2) we don't have new values, and can deliver empty response back
-	if _, destructed := s.db.stateObjectsDestruct[s.address]; destructed {
+	if _, destructed := s.db.getStateObjectsDestruct(s.address); destructed {
 		return common.Hash{}
 	}
 	// If no live objects are available, attempt to use snapshots
@@ -261,11 +278,49 @@ func (s *stateObject) finalise(prefetch bool) {
 			slotsToPrefetch = append(slotsToPrefetch, common.CopyBytes(key[:])) // Copy needed for closure
 		}
 	}
+
+	if s.dirtyNonce != nil {
+		s.data.Nonce = *s.dirtyNonce
+		s.dirtyNonce = nil
+	}
+	if s.dirtyBalance != nil {
+		s.data.Balance = s.dirtyBalance
+		s.dirtyBalance = nil
+	}
+	if s.dirtyCodeHash != nil {
+		s.data.CodeHash = s.dirtyCodeHash
+		s.dirtyCodeHash = nil
+	}
 	if s.db.prefetcher != nil && prefetch && len(slotsToPrefetch) > 0 && s.data.Root != types.EmptyRootHash {
 		s.db.prefetcher.prefetch(s.addrHash, s.data.Root, s.address, slotsToPrefetch)
 	}
 	if len(s.dirtyStorage) > 0 {
 		s.dirtyStorage = make(Storage)
+	}
+}
+
+func (s *stateObject) finaliseRWSet() {
+	if s.db.mvStates == nil {
+		return
+	}
+	ms := s.db.mvStates
+	for key, value := range s.dirtyStorage {
+		// three are some unclean dirtyStorage from previous reverted txs, it will skip finalise
+		// so add a new rule, if val has no change, then skip it
+		if value == s.GetCommittedState(key) {
+			continue
+		}
+		ms.RecordStorageWrite(s.address, key)
+	}
+
+	if s.dirtyNonce != nil && *s.dirtyNonce != s.data.Nonce {
+		ms.RecordAccountWrite(s.address, types.AccountNonce)
+	}
+	if s.dirtyBalance != nil && s.dirtyBalance.Cmp(s.data.Balance) != 0 {
+		ms.RecordAccountWrite(s.address, types.AccountBalance)
+	}
+	if s.dirtyCodeHash != nil && !slices.Equal(s.dirtyCodeHash, s.data.CodeHash) {
+		ms.RecordAccountWrite(s.address, types.AccountCodeHash)
 	}
 }
 
@@ -291,6 +346,7 @@ func (s *stateObject) updateTrie() (Trie, error) {
 	var (
 		storage map[common.Hash][]byte
 		origin  map[common.Hash][]byte
+		hasher  = crypto.NewKeccakState()
 	)
 	tr, err := s.getTrie()
 	if err != nil {
@@ -299,61 +355,84 @@ func (s *stateObject) updateTrie() (Trie, error) {
 	}
 	// Insert all the pending storage updates into the trie
 	usedStorage := make([][]byte, 0, len(s.pendingStorage))
+	dirtyStorage := make(map[common.Hash][]byte)
+
 	for key, value := range s.pendingStorage {
 		// Skip noop changes, persist actual changes
 		if value == s.originStorage[key] {
 			continue
 		}
-		prev := s.originStorage[key]
-		s.originStorage[key] = value
-
-		var encoded []byte // rlp-encoded value to be used by the snapshot
-		if (value == common.Hash{}) {
-			if err := tr.DeleteStorage(s.address, key[:]); err != nil {
-				s.db.setError(err)
-				return nil, err
-			}
-			s.db.StorageDeleted += 1
-		} else {
-			// Encoding []byte cannot fail, ok to ignore the error.
-			trimmed := common.TrimLeftZeroes(value[:])
-			encoded, _ = rlp.EncodeToBytes(trimmed)
-			if err := tr.UpdateStorage(s.address, key[:], trimmed); err != nil {
-				s.db.setError(err)
-				return nil, err
-			}
-			s.db.StorageUpdated += 1
+		var v []byte
+		if value != (common.Hash{}) {
+			value := value
+			v = common.TrimLeftZeroes(value[:])
 		}
-		// Cache the mutated storage slots until commit
-		if storage == nil {
-			if storage = s.db.storages[s.addrHash]; storage == nil {
-				storage = make(map[common.Hash][]byte)
-				s.db.storages[s.addrHash] = storage
-			}
-		}
-		khash := crypto.HashData(s.db.hasher, key[:])
-		storage[khash] = encoded // encoded will be nil if it's deleted
-
-		// Cache the original value of mutated storage slots
-		if origin == nil {
-			if origin = s.db.storagesOrigin[s.address]; origin == nil {
-				origin = make(map[common.Hash][]byte)
-				s.db.storagesOrigin[s.address] = origin
-			}
-		}
-		// Track the original value of slot only if it's mutated first time
-		if _, ok := origin[khash]; !ok {
-			if prev == (common.Hash{}) {
-				origin[khash] = nil // nil if it was not present previously
-			} else {
-				// Encoding []byte cannot fail, ok to ignore the error.
-				b, _ := rlp.EncodeToBytes(common.TrimLeftZeroes(prev[:]))
-				origin[khash] = b
-			}
-		}
-		// Cache the items for preloading
-		usedStorage = append(usedStorage, common.CopyBytes(key[:])) // Copy needed for closure
+		dirtyStorage[key] = v
 	}
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for key, value := range dirtyStorage {
+			if len(value) == 0 {
+				if err := tr.DeleteStorage(s.address, key[:]); err != nil {
+					s.db.setError(err)
+				}
+				s.db.StorageDeleted += 1
+			} else {
+				if err := tr.UpdateStorage(s.address, key[:], value); err != nil {
+					s.db.setError(err)
+				}
+				s.db.StorageUpdated += 1
+			}
+			// Cache the items for preloading
+			usedStorage = append(usedStorage, common.CopyBytes(key[:]))
+		}
+	}()
+	// If state snapshotting is active, cache the data til commit
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		s.db.StorageMux.Lock()
+		// The snapshot storage map for the object
+		storage = s.db.storages[s.addrHash]
+		if storage == nil {
+			storage = make(map[common.Hash][]byte, len(dirtyStorage))
+			s.db.storages[s.addrHash] = storage
+		}
+		// Cache the original value of mutated storage slots
+		origin = s.db.storagesOrigin[s.address]
+		if origin == nil {
+			origin = make(map[common.Hash][]byte)
+			s.db.storagesOrigin[s.address] = origin
+		}
+		s.db.StorageMux.Unlock()
+		for key, value := range dirtyStorage {
+			khash := crypto.HashData(hasher, key[:])
+
+			// rlp-encoded value to be used by the snapshot
+			var encoded []byte
+			if len(value) != 0 {
+				encoded, _ = rlp.EncodeToBytes(value)
+			}
+			storage[khash] = encoded // encoded will be nil if it's deleted
+
+			// Track the original value of slot only if it's mutated first time
+			prev := s.originStorage[key]
+			s.originStorage[key] = common.BytesToHash(value) // fill back left zeroes by BytesToHash
+			if _, ok := origin[khash]; !ok {
+				if prev == (common.Hash{}) {
+					origin[khash] = nil // nil if it was not present previously
+				} else {
+					// Encoding []byte cannot fail, ok to ignore the error.
+					b, _ := rlp.EncodeToBytes(common.TrimLeftZeroes(prev[:]))
+					origin[khash] = b
+				}
+			}
+		}
+	}()
+	wg.Wait()
+
 	if s.db.prefetcher != nil {
 		s.db.prefetcher.used(s.addrHash, s.data.Root, usedStorage)
 	}
@@ -413,37 +492,37 @@ func (s *stateObject) commit() (*trienode.NodeSet, error) {
 
 // AddBalance adds amount to s's balance.
 // It is used to add funds to the destination account of a transfer.
-func (s *stateObject) AddBalance(amount *big.Int) {
+func (s *stateObject) AddBalance(amount *uint256.Int) {
 	// EIP161: We must check emptiness for the objects such that the account
 	// clearing (0,0,0 objects) can take effect.
-	if amount.Sign() == 0 {
+	if amount.IsZero() {
 		if s.empty() {
 			s.touch()
 		}
 		return
 	}
-	s.SetBalance(new(big.Int).Add(s.Balance(), amount))
+	s.SetBalance(new(uint256.Int).Add(s.Balance(), amount))
 }
 
 // SubBalance removes amount from s's balance.
 // It is used to remove funds from the origin account of a transfer.
-func (s *stateObject) SubBalance(amount *big.Int) {
-	if amount.Sign() == 0 {
+func (s *stateObject) SubBalance(amount *uint256.Int) {
+	if amount.IsZero() {
 		return
 	}
-	s.SetBalance(new(big.Int).Sub(s.Balance(), amount))
+	s.SetBalance(new(uint256.Int).Sub(s.Balance(), amount))
 }
 
-func (s *stateObject) SetBalance(amount *big.Int) {
+func (s *stateObject) SetBalance(amount *uint256.Int) {
 	s.db.journal.append(balanceChange{
 		account: &s.address,
-		prev:    new(big.Int).Set(s.data.Balance),
+		prev:    new(uint256.Int).Set(s.Balance()),
 	})
 	s.setBalance(amount)
 }
 
-func (s *stateObject) setBalance(amount *big.Int) {
-	s.data.Balance = amount
+func (s *stateObject) setBalance(amount *uint256.Int) {
+	s.dirtyBalance = amount
 }
 
 func (s *stateObject) deepCopy(db *StateDB) *stateObject {
@@ -464,6 +543,16 @@ func (s *stateObject) deepCopy(db *StateDB) *stateObject {
 	obj.selfDestructed = s.selfDestructed
 	obj.dirtyCode = s.dirtyCode
 	obj.deleted = s.deleted
+	if s.dirtyBalance != nil {
+		obj.dirtyBalance = new(uint256.Int).Set(s.dirtyBalance)
+	}
+	if s.dirtyNonce != nil {
+		obj.dirtyNonce = new(uint64)
+		*obj.dirtyNonce = *s.dirtyNonce
+	}
+	if s.dirtyCodeHash != nil {
+		obj.dirtyCodeHash = s.dirtyCodeHash
+	}
 	return obj
 }
 
@@ -521,7 +610,7 @@ func (s *stateObject) SetCode(codeHash common.Hash, code []byte) {
 
 func (s *stateObject) setCode(codeHash common.Hash, code []byte) {
 	s.code = code
-	s.data.CodeHash = codeHash[:]
+	s.dirtyCodeHash = codeHash[:]
 	s.dirtyCode = true
 	compiler.GenOrLoadOptimizedCode(codeHash, s.code)
 }
@@ -529,24 +618,33 @@ func (s *stateObject) setCode(codeHash common.Hash, code []byte) {
 func (s *stateObject) SetNonce(nonce uint64) {
 	s.db.journal.append(nonceChange{
 		account: &s.address,
-		prev:    s.data.Nonce,
+		prev:    s.Nonce(),
 	})
 	s.setNonce(nonce)
 }
 
 func (s *stateObject) setNonce(nonce uint64) {
-	s.data.Nonce = nonce
+	s.dirtyNonce = &nonce
 }
 
 func (s *stateObject) CodeHash() []byte {
+	if len(s.dirtyCodeHash) > 0 {
+		return s.dirtyCodeHash
+	}
 	return s.data.CodeHash
 }
 
-func (s *stateObject) Balance() *big.Int {
+func (s *stateObject) Balance() *uint256.Int {
+	if s.dirtyBalance != nil {
+		return s.dirtyBalance
+	}
 	return s.data.Balance
 }
 
 func (s *stateObject) Nonce() uint64 {
+	if s.dirtyNonce != nil {
+		return *s.dirtyNonce
+	}
 	return s.data.Nonce
 }
 

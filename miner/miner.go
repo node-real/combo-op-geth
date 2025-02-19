@@ -19,10 +19,15 @@ package miner
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"errors"
 	"fmt"
 	"math/big"
 	"sync"
 	"time"
+
+	"github.com/ethereum/go-ethereum/consensus/misc/eip1559"
+	"github.com/ethereum/go-ethereum/consensus/misc/eip4844"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
@@ -41,10 +46,10 @@ import (
 
 var (
 	commitDepositTxsTimer = metrics.NewRegisteredTimer("miner/commit/deposit/txs", nil)
-	packFromTxpoolTimer = metrics.NewRegisteredTimer("miner/pack/txpool/txs", nil)
-	commitTxpoolTxsTimer = metrics.NewRegisteredTimer("miner/commit/txpool/txs", nil)
-	assembleBlockTimer = metrics.NewRegisteredTimer("miner/assemble/block", nil)
-	buildBlockTimer = metrics.NewRegisteredTimer("miner/build/block", nil)
+	packFromTxpoolTimer   = metrics.NewRegisteredTimer("miner/pack/txpool/txs", nil)
+	commitTxpoolTxsTimer  = metrics.NewRegisteredTimer("miner/commit/txpool/txs", nil)
+	assembleBlockTimer    = metrics.NewRegisteredTimer("miner/assemble/block", nil)
+	buildBlockTimer       = metrics.NewRegisteredTimer("miner/build/block", nil)
 
 	accountReadTimer   = metrics.NewRegisteredTimer("miner/account/reads", nil)
 	accountHashTimer   = metrics.NewRegisteredTimer("miner/account/hashes", nil)
@@ -59,10 +64,25 @@ var (
 	snapshotAccountReadTimer = metrics.NewRegisteredTimer("miner/snapshot/account/reads", nil)
 	snapshotStorageReadTimer = metrics.NewRegisteredTimer("miner/snapshot/storage/reads", nil)
 
-	waitPayloadTimer = metrics.NewRegisteredTimer("miner/wait/payload", nil)
+	waitPayloadTimer   = metrics.NewRegisteredTimer("miner/wait/payload", nil)
+	txDAGGenerateTimer = metrics.NewRegisteredTimer("miner/txdag/gen", nil)
 
 	isBuildBlockInterruptCounter = metrics.NewRegisteredCounter("miner/build/interrupt", nil)
 )
+
+var defaultCoinBaseAddress = common.HexToAddress("0x4200000000000000000000000000000000000011")
+
+type MevConfig struct {
+	MevEnabled             bool     // Whether to enable Mev or not
+	MevReceivers           []string // The list of Mev bundle receivers
+	MevBundleGasPriceFloor int64    // The minimal bundle gas Price
+}
+
+var DefaultMevConfig = MevConfig{
+	MevEnabled:             false,
+	MevReceivers:           nil,
+	MevBundleGasPriceFloor: 1,
+}
 
 // Backend wraps all methods required for mining. Only full node is capable
 // to offer all the functions here.
@@ -86,13 +106,18 @@ type Config struct {
 
 	NewPayloadTimeout time.Duration // The maximum time allowance for creating a new payload
 
-	RollupComputePendingBlock bool // Compute the pending block from tx-pool, instead of copying the latest-block
+	RollupComputePendingBlock bool   // Compute the pending block from tx-pool, instead of copying the latest-block
+	EffectiveGasCeil          uint64 // if non-zero, a gas ceiling to apply independent of the header's gaslimit value
+
+	Mev MevConfig // Mev configuration
+
+	ParallelTxDAGSenderPriv *ecdsa.PrivateKey // The private key for the parallel tx DAG sender
 }
 
 // DefaultConfig contains default settings for miner.
 var DefaultConfig = Config{
 	GasCeil:  30000000,
-	GasPrice: big.NewInt(params.GWei),
+	GasPrice: big.NewInt(params.Wei),
 
 	// The default recommit time is chosen as two seconds since
 	// consensus-layer usually will wait a half slot of time(6s)
@@ -100,6 +125,8 @@ var DefaultConfig = Config{
 	// run 3 rounds.
 	Recommit:          2 * time.Second,
 	NewPayloadTimeout: 2 * time.Second,
+
+	Mev: DefaultMevConfig,
 }
 
 // Miner creates blocks and searches for proof-of-work values.
@@ -231,6 +258,11 @@ func (miner *Miner) SetExtra(extra []byte) error {
 	return nil
 }
 
+func (miner *Miner) SetGasTip(tip *big.Int) error {
+	miner.worker.setGasTip(tip)
+	return nil
+}
+
 // SetRecommitInterval sets the interval for sealing work resubmitting.
 func (miner *Miner) SetRecommitInterval(interval time.Duration) {
 	miner.worker.setRecommitInterval(interval)
@@ -277,4 +309,92 @@ func (miner *Miner) SubscribePendingLogs(ch chan<- []*types.Log) event.Subscript
 // BuildPayload builds the payload according to the provided parameters.
 func (miner *Miner) BuildPayload(args *BuildPayloadArgs) (*Payload, error) {
 	return miner.worker.buildPayload(args)
+}
+
+func (miner *Miner) SimulateBundle(bundle *types.Bundle) (*big.Int, error) {
+
+	env, err := miner.prepareSimulationEnv()
+	if err != nil {
+		return nil, err
+	}
+
+	s, err := miner.worker.simulateBundles(env, []*types.Bundle{bundle})
+	if err != nil {
+		return nil, err
+	}
+
+	if len(s) == 0 {
+		return nil, errors.New("no valid sim result")
+	}
+
+	return s[0].BundleGasPrice, nil
+}
+
+func (miner *Miner) SimulateGaslessBundle(bundle *types.Bundle) (*types.SimulateGaslessBundleResp, error) {
+
+	env, err := miner.prepareSimulationEnv()
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := miner.worker.simulateGaslessBundle(env, bundle)
+	if err != nil {
+		return nil, err
+	}
+
+	return resp, nil
+}
+
+func (miner *Miner) prepareSimulationEnv() (*environment, error) {
+	parent := miner.eth.BlockChain().CurrentBlock()
+	timestamp := int64(parent.Time + 1)
+
+	header := &types.Header{
+		ParentHash: parent.Hash(),
+		Number:     new(big.Int).Add(parent.Number, common.Big1),
+		GasLimit:   core.CalcGasLimit(parent.GasLimit, miner.worker.config.GasCeil),
+		Time:       uint64(timestamp),
+		Coinbase:   defaultCoinBaseAddress,
+	}
+
+	// Set baseFee and GasLimit if we are on an EIP-1559 chain
+	if miner.worker.chainConfig.IsLondon(header.Number) {
+		header.BaseFee = eip1559.CalcBaseFee(miner.worker.chainConfig, parent, header.Time)
+	}
+
+	if miner.worker.chainConfig.Optimism != nil && miner.worker.config.GasCeil != 0 {
+		// configure the gas limit of pending blocks with the miner gas limit config when using optimism
+		header.GasLimit = miner.worker.config.GasCeil
+	}
+
+	// Apply EIP-4844, EIP-4788.
+	if miner.worker.chainConfig.IsCancun(header.Number, header.Time) {
+		var excessBlobGas uint64
+		if miner.worker.chainConfig.IsCancun(parent.Number, parent.Time) {
+			excessBlobGas = eip4844.CalcExcessBlobGas(*parent.ExcessBlobGas, *parent.BlobGasUsed)
+		} else {
+			// For the first post-fork block, both parent.data_gas_used and parent.excess_data_gas are evaluated as 0
+			excessBlobGas = eip4844.CalcExcessBlobGas(0, 0)
+		}
+		header.BlobGasUsed = new(uint64)
+		header.ExcessBlobGas = &excessBlobGas
+	}
+
+	if err := miner.worker.engine.Prepare(miner.eth.BlockChain(), header); err != nil {
+		log.Error("Failed to prepare header for simulateBundle", "err", err)
+		return nil, err
+	}
+
+	state, err := miner.eth.BlockChain().StateAt(parent.Root)
+	if err != nil {
+		return nil, err
+	}
+
+	env := &environment{
+		header:  header,
+		state:   state.Copy(),
+		signer:  types.MakeSigner(miner.worker.chainConfig, header.Number, header.Time),
+		gasPool: prepareGasPool(),
+	}
+	return env, nil
 }
